@@ -1,0 +1,4 @@
+# Keep PowerShell scripts byte-exact (UTF-8 BOM + CRLF) so Windows PowerShell 5.1 reads them correctly
+*.ps1 -text
+*.psm1 -text
+*.psd1 -text
