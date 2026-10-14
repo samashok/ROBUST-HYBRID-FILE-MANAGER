@@ -27,6 +27,19 @@ function Show-Pause { param([string]$Message) }
 function Feed { param([string[]]$Lines) $global:Inputs.Clear(); $global:Prompts.Clear(); foreach ($l in $Lines) { $global:Inputs.Enqueue($l) } }
 function Run { param([scriptblock]$B) try { & $B 6>$null; return $null } catch { return $_.Exception.Message } }
 
+# --- Main menu layout: the shortcut keys fit on one line at 80 columns ---
+$global:Screen = New-Object System.Text.StringBuilder
+$realUiWidth = ${function:Get-UiWidth}
+function Get-UiWidth { return 79 }
+function Write-Host { param([Parameter(Position = 0)]$Object, [switch]$NoNewline, $ForegroundColor, $BackgroundColor, $Separator)
+    [void]$global:Screen.Append("$Object"); if (-not $NoNewline) { [void]$global:Screen.Append("`n") } }
+Show-MainMenu
+Remove-Item function:Write-Host
+Set-Item function:Get-UiWidth $realUiWidth
+$menuLines = $global:Screen.ToString() -split "`n"
+$toolLine = @($menuLines | Where-Object { $_ -match 'W Guided' })
+Assert ($toolLine.Count -eq 1 -and $toolLine[0] -match 'Q Quit' -and @($menuLines | Where-Object { $_.Length -gt 79 }).Count -eq 0) 'menu shortcut keys on one line at 80 columns'
+
 # --- Local copy through the option screen ---
 $src = "$root/src"; $null = New-Item -ItemType Directory "$src/a" -Force; [IO.File]::WriteAllText("$src/a/x.txt", 'x'); [IO.File]::WriteAllText("$src/y.txt", 'yy')
 Feed @("`"$src`"", "$root/dst", 'm')

@@ -5814,9 +5814,10 @@ function Show-MainMenu {
     $rowsOut = New-Object System.Collections.Generic.List[object]
     $cur = New-Object System.Collections.Generic.List[object]; $len = 2
     foreach ($t in $tools) {
-        $w = 2 + $t[1].Length
-        $need = if ($cur.Count -gt 0) { 3 + $w } else { $w }
-        if ($cur.Count -gt 0 -and ($len + $need) -gt $W) { $rowsOut.Add($cur.ToArray()); $cur = New-Object System.Collections.Generic.List[object]; $len = 2; $need = $w }
+        # (PowerShell variable names ignore case, so this must not be called $w - that is $W)
+        $cellW = 2 + $t[1].Length
+        $need = if ($cur.Count -gt 0) { 3 + $cellW } else { $cellW }
+        if ($cur.Count -gt 0 -and ($len + $need) -gt $W) { $rowsOut.Add($cur.ToArray()); $cur = New-Object System.Collections.Generic.List[object]; $len = 2; $need = $cellW }
         $cur.Add($t); $len += $need
     }
     if ($cur.Count -gt 0) { $rowsOut.Add($cur.ToArray()) }
@@ -5830,7 +5831,7 @@ function Show-MainMenu {
         Write-Host ''
     }
     $tip = $script:Tips[(Get-Random -Minimum 0 -Maximum $script:Tips.Count)]
-    Write-Host ("  Tip: " + (Get-FitText -Text $tip -Width ($W - 8))) -ForegroundColor DarkGray
+    Write-Marked -Prefix '  Tip: ' -Message $tip -Color DarkGray
 }
 
 # Finds options whose number, title or keywords match what was typed.
