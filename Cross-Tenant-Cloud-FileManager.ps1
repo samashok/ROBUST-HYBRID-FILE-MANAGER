@@ -80,6 +80,9 @@
         Ease of use
           * Path prompts accept drag-and-drop, quoted paths, [B] Browse dialog, [F]
             Favourites and [R] Recent; invalid input re-prompts instead of failing later.
+          * The temp download buffer is still asked for on every download / archive job
+            (ENTER = suggested folder); it now shows free space and warns when the buffer
+            and destination are on different drives (slow cross-drive moves).
           * One shared item picker for every batch screen (3 | 2-5 | 1,3,7 | 1 3 7 | A).
           * Cloud connections are reused between operations on the same site, so you sign
             in far less often (same -UseWebLogin method).
@@ -90,8 +93,9 @@
           * Archive verification now checks the files on DISK against a fresh, strict cloud
             inventory. Folder-listing failures, name collisions, cancelled runs, missing or
             wrong-size files all block deletion (previously some of these could still
-            delete cloud data). Single-file archives delete with Remove-PnPFile, library
-            roots are never deleted (their contents are), and every delete asks once.
+            delete cloud data). Single-file archives delete with Remove-PnPFile and library
+            roots are never deleted (their contents are). Archive options stay fully
+            unattended - verification is the gate, there is no prompt at the end.
           * Cancel now stops the whole run (all items, libraries and leavers).
           * Leaver runs report real outcomes instead of always "ARCHIVED".
           * Archive resumes compare dates as well as sizes, and an archive never overwrites a
@@ -1448,21 +1452,42 @@ function Read-CloudFolder {
     }
 }
 
-# The temp buffer is not asked for every time any more: the Settings value (or the
-# Windows temp folder) is used, and only if it is not writable is the user asked.
-function Get-BufferFolder {
-    $default = $script:Settings.DefaultBuffer
-    if ([string]::IsNullOrWhiteSpace($default)) { $default = [System.IO.Path]::GetTempPath().TrimEnd('\', '/') }
-    if (Test-WritableFolder $default) {
-        Write-Hint "Temp buffer: $default   (change it in [S] Settings)"
-        return $default
+# Asks for the temp download buffer every time (as in earlier versions): files are
+# downloaded there first and then moved into the destination. Choosing a folder on the
+# SAME drive as the destination makes that move instant, and choosing a drive with room
+# avoids filling a small C: drive on servers. ENTER uses the suggested folder (the one
+# used last in this session, else the Settings default, else the Windows temp folder).
+$script:LastBuffer = ''
+function Read-BufferFolder {
+    param([string]$DestPath = '')
+    $default = $script:LastBuffer
+    if (-not $default) { $default = $script:Settings.DefaultBuffer }
+    if (-not $default) { $default = [System.IO.Path]::GetTempPath().TrimEnd('\', '/') }
+    $destRoot = ''
+    if ($DestPath) { try { $destRoot = [System.IO.Path]::GetPathRoot((Remove-LongPrefix (Resolve-LocalPath $DestPath))) } catch { $destRoot = '' } }
+    Write-Host ""
+    Write-Info 'TEMP BUFFER - each file is downloaded here first, then moved into the destination.'
+    Write-Hint 'For the fastest moves pick a folder on the SAME drive as the destination, on a drive with enough free space for your largest files.'
+    if ($destRoot) {
+        $df = Get-PathFreeSpace -Path $DestPath
+        Write-Hint ("Destination drive: {0}{1}" -f $destRoot, $(if ($df -ge 0) { "  ($(Format-FileSize $df) free)" } else { '' }))
     }
-    Write-Caution "The temp buffer '$default' is not writable."
     while ($true) {
-        $v = Read-LocalFolder -Prompt 'Choose a temp buffer folder (e.g. C:\Temp):' -LogLabel 'Buffer' -CreateIfMissing
-        if ($null -eq $v -or $v -eq '') { return $null }
-        if (Test-WritableFolder $v) { return $v }
-        Write-Bad "Cannot write to '$v' - please choose another folder."
+        $v = Read-LocalFolder -Prompt 'Temp buffer folder:' -LogLabel 'Buffer path' -AllowEmpty -EmptyHint "use $default" -CreateIfMissing
+        if ($null -eq $v) { return $null }
+        if ($v -eq '') { $v = $default; Write-Hint "Using $v" }
+        if (-not (Test-WritableFolder $v)) { Write-Bad "Cannot write to '$v' - please choose another folder (for example D:\Temp)."; continue }
+        $bufRoot = ''
+        try { $bufRoot = [System.IO.Path]::GetPathRoot((Remove-LongPrefix (Resolve-LocalPath $v))) } catch { }
+        $bf = Get-PathFreeSpace -Path $v
+        if ($bf -ge 0) { Write-Hint ("Buffer drive: {0}  ({1} free)" -f $bufRoot, (Format-FileSize $bf)) }
+        if ($destRoot -and $bufRoot -and ($bufRoot -ine $destRoot)) {
+            Write-Caution ("The buffer is on {0} but the destination is on {1}: every file will be copied between drives after it downloads (slower)." -f $bufRoot, $destRoot)
+            if (-not (Read-YesNo -Question 'Use this buffer anyway?' -Default $true)) { continue }
+        }
+        $script:LastBuffer = $v
+        Write-Log "Temp buffer: $v" 'INFO' -FileOnly
+        return $v
     }
 }
 
@@ -4312,10 +4337,8 @@ function Perform-BatchArchiveDownload {
     $totals = @{ Archived = 0; Deleted = 0; DlFailed = 0; VerifyFailed = 0; DeleteFailed = 0; Bytes = [long]0; Cancelled = $false; Items = 0; CheckedOut = (New-Object System.Collections.Generic.List[string]); Rows = (New-Object System.Collections.Generic.List[hashtable]) }
     $base = Get-SiteRelativePath -SiteUrl $CloudData.SiteUrl -ServerRelativePath $CloudData.FolderPath
     if (-not $AutoSelectAll -and (Get-CloudFileIfFile -SiteRelativeUrl $base)) {
-        Write-Info 'The address points to a single file.'
-        if (Confirm-Start -Title 'READY TO ARCHIVE THIS FILE' -Color Red -Danger -DangerText 'Download, verify and then recycle the cloud copy?' -Rows @(@{ Label = 'Cloud file'; Value = $CloudData.FolderPath }, @{ Label = 'Save to'; Value = $LocalDest })) {
-            Perform-ArchiveDownload -CloudData $CloudData -LocalDest $LocalDest -BufferDest $BufferDest
-        } else { Write-Hint 'Nothing was changed.' }
+        Write-Info 'The address points to a single file - archiving it directly.'
+        Perform-ArchiveDownload -CloudData $CloudData -LocalDest $LocalDest -BufferDest $BufferDest
         return $totals
     }
     while ($true) {
@@ -4346,7 +4369,7 @@ function Perform-BatchArchiveDownload {
             if ($sel.Action -eq 'Refresh') { continue }
             if ($sel.Action -eq 'Search') { Invoke-CloudSearchLoop -CloudData $CloudData; continue }
             $chosen = @($sel.Indices | ForEach-Object { $items[$_] })
-            if (-not (Read-Confirmation -Message ("Archive {0} item(s)? Each one is downloaded, verified, then recycled in SharePoint (restorable for ~93 days)." -f $chosen.Count))) { Write-Hint 'Nothing was changed.'; continue }
+            Write-Hint ("Archiving {0} item(s) unattended: download -> verify -> recycle. Items that fail verification are never deleted. Press C to stop safely." -f $chosen.Count)
         }
         $nameMap = Get-LocalNameMap -Items $items -Used $UsedNames
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -4993,11 +5016,11 @@ function Show-OpIntro {
 
 # Shows what is about to happen and asks to start. -Danger requires typing YES.
 function Confirm-Start {
-    param([string]$Title, [object[]]$Rows, [string]$Color = 'Cyan', [switch]$Danger, [string]$DangerText = '')
+    param([string]$Title, [object[]]$Rows, [string]$Color = 'Cyan', [switch]$Danger, [string]$DangerText = '', [switch]$DefaultNo, [string]$Question = 'Start now?')
     Write-Host ""
     Write-Panel -Title $Title -Lines $Rows -Color $Color
     if ($Danger) { return (Read-Confirmation -Message $(if ($DangerText) { $DangerText } else { 'Start now?' }) -Color Yellow) }
-    return (Read-YesNo -Question 'Start now?' -Default $true)
+    return (Read-YesNo -Question $Question -Default (-not $DefaultNo))
 }
 
 function Read-RunAgain {
@@ -5023,11 +5046,10 @@ function Invoke-OpCloudCopyMove {
         if (-not $src) { return }
         $dst = Read-CloudFolder -Prompt "Destination folder it should go INTO:" -LogLabel 'Destination URL'
         if (-not $dst) { return }
-        if (Confirm-Start -Title "READY TO $($verb.ToUpper())" -Color Yellow -Rows @(
-                @{ Label = 'From'; Value = $src.FolderPath }, @{ Label = 'Into'; Value = $dst.FolderPath }
-                @{ Label = 'Result'; Value = (Join-CloudPath $dst.FolderPath (($src.FolderPath -split '/')[-1])) })) {
-            Perform-CloudTransfer -SrcData $src -DstData $dst -IsMove:$Move
-        }
+        Write-Panel -Title "CLOUD $($verb.ToUpper())" -Color Yellow -Lines @(
+            @{ Label = 'From'; Value = $src.FolderPath }, @{ Label = 'Into'; Value = $dst.FolderPath }
+            @{ Label = 'Result'; Value = (Join-CloudPath $dst.FolderPath (($src.FolderPath -split '/')[-1])) })
+        Perform-CloudTransfer -SrcData $src -DstData $dst -IsMove:$Move
         if (-not (Read-RunAgain "another cloud $verb")) { return }
     }
 }
@@ -5102,9 +5124,7 @@ function Invoke-OpLocalCopyMove {
         if (-not $dst) { return }
         $ov = Test-PathOverlap -Source $src -Destination $dst
         if ($ov -and -not [System.IO.File]::Exists((Get-LongPath $src))) { Write-Bad "$ov Please choose different folders."; continue }
-        if (Confirm-Start -Title "READY TO $($verb.ToUpper())" -Color Green -Rows @(@{ Label = 'From'; Value = (Format-PathWithStorageTag $src) }, @{ Label = 'Into'; Value = (Format-PathWithStorageTag $dst) })) {
-            $null = Perform-LocalTransfer -Src $src -Dst $dst -IsMove:$Move
-        }
+        $null = Perform-LocalTransfer -Src $src -Dst $dst -IsMove:$Move
         if (-not (Read-RunAgain "another local $verb")) { return }
     }
 }
@@ -5176,7 +5196,7 @@ function Invoke-OpDownload {
         if (-not $src) { return }
         $dst = Read-LocalFolder -Prompt 'Save into this folder on the PC / network (created if missing):' -LogLabel 'Destination path' -CreateIfMissing
         if (-not $dst) { return }
-        $buf = Get-BufferFolder
+        $buf = Read-BufferFolder -DestPath $dst
         if (-not $buf) { return }
         try { Connect-CloudSite -SiteUrl $src.SiteUrl } catch { Write-Bad "Could not connect: $($_.Exception.Message)"; Write-Hint 'Check the address, your internet connection and that you signed in with the right account.'; continue }
         if ($Batch) { Perform-CloudToLocalBatchDownload -CloudData $src -LocalDest $dst -BufferDest $buf }
@@ -5213,20 +5233,17 @@ function Invoke-OpArchive {
     Show-OpIntro -Key $(if ($Batch) { '18' } else { '17' }) -Title $(if ($Batch) { 'BATCH ARCHIVE - pick cloud items to archive and recycle' } else { 'ARCHIVE - download, verify, then recycle a cloud folder' }) -Color Red -What @(
         '1. DOWNLOAD everything to a local / network folder.   2. VERIFY every file on disk against a fresh SharePoint listing.   3. RECYCLE the cloud copy.'
         'Nothing is deleted unless step 2 passes completely. Re-running skips files already on disk, so an interrupted archive resumes.'
-    ) -Notes @('Deleted items go to the SharePoint Recycle Bin (about 93 days). A library root is never deleted - its contents are.') -Danger 'You confirm once before anything starts; after that it runs unattended (press C to stop safely).'
+    ) -Notes @('Deleted items go to the SharePoint Recycle Bin (about 93 days). A library root is never deleted - its contents are.') -Danger 'Fully automatic once started - no prompt at the end: if verification passes, the cloud copy is recycled. Press C at any time to stop safely.'
     while ($true) {
         $src = Read-CloudFolder -Prompt 'SharePoint / OneDrive folder (or file) to archive:' -LogLabel 'Archive source URL'
         if (-not $src) { return }
         $dst = Read-LocalFolder -Prompt 'Save the archive into this folder (created if missing):' -LogLabel 'Archive destination path' -CreateIfMissing
         if (-not $dst) { return }
-        $buf = Get-BufferFolder
+        $buf = Read-BufferFolder -DestPath $dst
         if (-not $buf) { return }
         try { Connect-CloudSite -SiteUrl $src.SiteUrl } catch { Write-Bad "Could not connect: $($_.Exception.Message)"; continue }
         if ($Batch) { $null = Perform-BatchArchiveDownload -CloudData $src -LocalDest $dst -BufferDest $buf }
-        elseif (Confirm-Start -Title 'READY TO ARCHIVE' -Color Red -Danger -DangerText 'Download, verify and then recycle the cloud copy?' -Rows @(
-                @{ Label = 'Cloud source'; Value = $src.FolderPath }, @{ Label = 'Save to'; Value = $dst }, 'If verification passes, the cloud copy goes to the SharePoint Recycle Bin.')) {
-            Perform-ArchiveDownload -CloudData $src -LocalDest $dst -BufferDest $buf
-        } else { Write-Hint 'Nothing was changed.' }
+        else { Perform-ArchiveDownload -CloudData $src -LocalDest $dst -BufferDest $buf }
         if (-not (Read-RunAgain 'archive something else')) { return }
     }
 }
@@ -5250,10 +5267,10 @@ function Invoke-OpMultiArchive {
     Show-OpIntro -Key '19' -Title 'MULTI-SOURCE ARCHIVE - archive several cloud folders in one run' -Color Red -What @(
         'Paste the addresses of several SharePoint / OneDrive folders. Each one is archived into its own sub-folder (named by you) under one destination: download -> verify -> recycle.'
         'Sources on different sites are handled automatically (you may be asked to sign in once per site).'
-    ) -Danger 'You confirm the plan once; then it runs unattended. A source that fails verification is never deleted.'
+    ) -Danger 'Runs unattended after you finish the list. A source that fails verification is never deleted.'
     $dst = Read-LocalFolder -Prompt 'Destination root folder (one sub-folder per source is created):' -LogLabel 'Multi-archive destination' -CreateIfMissing
     if (-not $dst) { return }
-    $buf = Get-BufferFolder
+    $buf = Read-BufferFolder -DestPath $dst
     if (-not $buf) { return }
     $sources = New-Object System.Collections.Generic.List[hashtable]
     $labels = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -5275,7 +5292,9 @@ function Invoke-OpMultiArchive {
     }
     if ($sources.Count -eq 0) { Write-Hint 'No sources entered.'; return }
     $rows = @(@{ Label = 'Destination root'; Value = $dst }, '-') + @($sources | ForEach-Object { @{ Label = $_.Label; Value = $_.CloudData.FolderPath } })
-    if (-not (Confirm-Start -Title ("ARCHIVE PLAN - {0} SOURCE(S)" -f $sources.Count) -Rows $rows -Color Red -Danger -DangerText 'Archive all of these (download, verify, recycle)?')) { Write-Hint 'Nothing was changed.'; return }
+    Write-Host ""
+    Write-Panel -Title ("ARCHIVE PLAN - {0} SOURCE(S)" -f $sources.Count) -Lines $rows -Color Red
+    Write-Hint 'Starting now - each source is downloaded, verified and recycled. Press C at any time to stop safely.'
     Perform-MultiSourceArchive -Sources $sources.ToArray() -LocalDest $dst -BufferDest $buf
     Show-Pause
 }
@@ -5329,7 +5348,7 @@ function Invoke-OpLeaver {
     Show-OpIntro -Key '20' -Title "LEAVER ONEDRIVE ARCHIVE - archive one leaver's OneDrive" -Color DarkYellow -What @(
         "Connects to a leaver's OneDrive, then archives every document library: download -> verify -> recycle, item by item."
         'Documents library content lands directly in your destination; other libraries get their own sub-folder.'
-    ) -Notes @("Enter the leaver's email (the OneDrive address is built for you) or paste any OneDrive address.", 'If their licence was removed and the OneDrive is frozen, use [23] instead.') -Danger 'You confirm once before it starts; after that it runs unattended (press C to stop safely).'
+    ) -Notes @("Enter the leaver's email (the OneDrive address is built for you) or paste any OneDrive address.", 'If their licence was removed and the OneDrive is frozen, use [23] instead.') -Danger 'Fully automatic once started: items that pass verification are recycled. Press C at any time to stop safely.'
     while ($true) {
         $in = Read-PathInput -Prompt "Leaver's email address OR their OneDrive address:" -Type Any -LogLabel 'Leaver UPN or URL' -FreeText
         if ($in -eq 'Q') { return }
@@ -5338,12 +5357,9 @@ function Invoke-OpLeaver {
         Write-Hint "OneDrive: $site"
         $dst = Read-LocalFolder -Prompt 'Save the archive into this folder (created if missing):' -LogLabel 'Leaver destination' -CreateIfMissing
         if (-not $dst) { return }
-        $buf = Get-BufferFolder
+        $buf = Read-BufferFolder -DestPath $dst
         if (-not $buf) { return }
-        if (Confirm-Start -Title 'READY TO ARCHIVE THIS ONEDRIVE' -Color DarkYellow -Danger -DangerText 'Archive every library and recycle the cloud copies that pass verification?' -Rows @(
-                @{ Label = 'OneDrive'; Value = $site }, @{ Label = 'Save to'; Value = $dst })) {
-            Invoke-LeaverArchiveSingle -SiteUrl $site -LocalDest $dst -BufferDest $buf
-        } else { Write-Hint 'Nothing was changed.' }
+        Invoke-LeaverArchiveSingle -SiteUrl $site -LocalDest $dst -BufferDest $buf
         if (-not (Read-RunAgain 'archive another leaver')) { return }
     }
 }
@@ -5355,7 +5371,7 @@ function Invoke-OpMultiLeaver {
     ) -Danger 'You confirm the plan once; then it runs unattended. Nothing that fails verification is deleted.'
     $dst = Read-LocalFolder -Prompt 'Destination root (one sub-folder per leaver):' -LogLabel 'Multi-leaver destination' -CreateIfMissing
     if (-not $dst) { return }
-    $buf = Get-BufferFolder
+    $buf = Read-BufferFolder -DestPath $dst
     if (-not $buf) { return }
     $list = New-Object System.Collections.Generic.List[hashtable]
     $labels = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -5441,7 +5457,7 @@ function Invoke-OpLicensedLeaver {
     )
     $dst = Read-LocalFolder -Prompt 'Step 1 of 4 - destination folder (one sub-folder per leaver):' -LogLabel 'Licensed destination' -CreateIfMissing
     if (-not $dst) { return }
-    $buf = Get-BufferFolder
+    $buf = Read-BufferFolder -DestPath $dst
     if (-not $buf) { return }
 
     if (-not (Ensure-PnPModule)) { return }
@@ -5502,7 +5518,7 @@ function Invoke-OpLicensedLeaver {
         '-'
     ) + @($parsed.Leavers | ForEach-Object { @{ Label = $_.FolderName; Value = "$($_.Email)  |  $($_.SiteUrl -replace '^https://', '')" } })
     if ($parsed.Warnings.Count -gt 0) { $plan += '-'; foreach ($w in $parsed.Warnings) { $plan += @{ Text = $w; Color = 'Yellow' } } }
-    if (-not (Confirm-Start -Title ("PLAN - {0} LEAVER(S)" -f $parsed.Leavers.Count) -Rows $plan -Color Cyan -Danger -DangerText 'Start: licence -> archive -> un-licence, one leaver at a time?')) { Write-Hint 'Nothing was changed.'; return }
+    if (-not (Confirm-Start -Title ("PLAN - {0} LEAVER(S)" -f $parsed.Leavers.Count) -Rows $plan -Color Cyan -DefaultNo -Question ("Proceed with {0} leaver(s)?" -f $parsed.Leavers.Count))) { Write-Hint 'Cancelled - no changes made.'; return }
     Perform-LicensedLeaverArchive -Leavers $parsed.Leavers -LocalDest $dst -BufferDest $buf -GroupId $group.id -GroupName $group.displayName
     Show-Pause
 }
@@ -5558,7 +5574,7 @@ function Show-SettingsScreen {
             @{ Label = '2  Explanations'; Value = $(if ($s.ShowGuides) { 'Shown when an option opens' } else { 'Hidden (header only)' }) }
             @{ Label = '3  Console detail'; Value = $(if ($s.ConsoleDetail -eq 'Compact') { 'Compact - errors and summaries only (faster)' } else { 'Normal - a line per file' }) }
             @{ Label = '4  Completion chime'; Value = $(if ($s.Sound) { 'On (jobs over 30 seconds)' } else { 'Off' }) }
-            @{ Label = '5  Temp download buffer'; Value = $bufText }
+            @{ Label = '5  Suggested temp buffer'; Value = "$bufText (offered when you press ENTER at the buffer question)" }
             @{ Label = '6  Large-file progress'; Value = "Files of $($s.LargeFileMB) MB or more get their own progress bar" }
             @{ Label = '7  Reset to defaults'; Value = '' }
         )
@@ -5569,7 +5585,7 @@ function Show-SettingsScreen {
             '3' { $s.ConsoleDetail = $(if ($s.ConsoleDetail -eq 'Compact') { 'Normal' } else { 'Compact' }) }
             '4' { $s.Sound = -not $s.Sound; if ($s.Sound) { try { [Console]::Beep(784, 120); [Console]::Beep(1046, 180) } catch { } } }
             '5' {
-                $b = Read-LocalFolder -Prompt 'Temp buffer folder (ENTER = Windows temp folder):' -LogLabel 'Default buffer' -AllowEmpty -EmptyHint 'use the Windows temp folder' -CreateIfMissing
+                $b = Read-LocalFolder -Prompt 'Suggested temp buffer folder (ENTER = Windows temp folder):' -LogLabel 'Default buffer' -AllowEmpty -EmptyHint 'use the Windows temp folder' -CreateIfMissing
                 if ($null -ne $b) {
                     if ($b -and -not (Test-WritableFolder $b)) { Write-Bad 'That folder is not writable.' } else { $s.DefaultBuffer = $b }
                 }

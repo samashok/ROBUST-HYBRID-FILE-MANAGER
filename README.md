@@ -78,7 +78,10 @@ Every job can simply be **run again**: files that are already identical are skip
   already in the archive folder. Only items that were verified are recycled.
 * The root of a document library is never deleted — its contents are. Leaver options only accept OneDrive
   (`/personal/`) addresses.
-* Every delete or archive asks once, before it starts (type `YES`).
+* Deletes and wipes ask you to type `YES` first. Archive options 17–20 are fully unattended once started:
+  verification is the gate, so there is no prompt at the end of a long run (press `C` to stop safely).
+* Download and archive jobs ask for the **temp buffer** every time (ENTER = suggested folder). Pick a folder
+  on the same drive as the destination with enough free space; the prompt warns when they are on different drives.
 * A local move onto itself — including the same folder reached through a mapped drive, a server alias or a
   junction — is refused; emptied source folders are removed
   only when they are truly empty; junctions / symbolic links are never followed or emptied.
